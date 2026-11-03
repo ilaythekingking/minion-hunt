@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ציד מיניונים</title>
+<style>
+  :root {
+    --hud: #ffffff;
+    --panel-bg: rgba(10, 10, 20, 0.82);
+    --accent: #ffd93b;
+    --danger: #ff5a5a;
+    --bonus: #5ee7ff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: var(--hud);
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    touch-action: none;   /* כדי שגרירה באצבע לא תגלול את הדף */
+    cursor: none;
+  }
+  .hud {
+    position: fixed;
+    inset: 0 0 auto 0;
+    display: flex;
+    justify-content: space-between;
+    padding: 14px 20px;
+    font-size: clamp(18px, 3.5vw, 28px);
+    font-weight: 700;
+    pointer-events: none;
+    text-shadow: 0 2px 4px #000;
+  }
+  .hud.hidden { visibility: hidden; }
+  #time.low { color: var(--danger); }
+  #time.bonus, #score.bonus { color: var(--bonus); }
+  .panel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(92vw, 560px);
+    padding: 28px 24px;
+    text-align: center;
+    background: var(--panel-bg);
+    border: 2px solid rgba(255, 255, 255, 0.25);
+    border-radius: 18px;
+    cursor: default;
+  }
+  .panel.hidden { display: none; }
+  .panel h1 { margin: 0 0 12px; font-size: clamp(32px, 7vw, 52px); color: var(--accent); }
+  .panel p { margin: 6px 0; font-size: clamp(16px, 3.2vw, 20px); line-height: 1.5; }
+  .panel .score { font-size: clamp(22px, 5vw, 30px); font-weight: 700; }
+  .panel button {
+    margin-top: 18px;
+    padding: 12px 34px;
+    font: inherit;
+    font-size: 22px;
+    font-weight: 700;
+    color: #222;
+    background: var(--accent);
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+  }
+  .panel button:hover { filter: brightness(1.08); }
+  .panel button:disabled { opacity: 0.6; cursor: wait; }
+  .panel { max-height: 94vh; overflow-y: auto; }
+  .panel h2 { margin: 22px 0 8px; font-size: 22px; color: var(--accent); }
+  .panel .muted { color: #b9b9c9; font-size: 16px; }
+  .panel .error { color: var(--danger); min-height: 1.5em; font-size: 16px; }
+  .panel .link {
+    margin: 0 6px;
+    padding: 0;
+    font-size: 16px;
+    font-weight: 400;
+    color: #b9b9c9;
+    background: none;
+    text-decoration: underline;
+  }
+  .form label {
+    display: block;
+    margin: 12px auto 0;
+    max-width: 320px;
+    text-align: right;
+    font-size: 18px;
+  }
+  .form input {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+    padding: 10px 12px;
+    font: inherit;
+    font-size: 20px;
+    color: #111;
+    border: none;
+    border-radius: 10px;
+  }
+  .board ol {
+    margin: 0 auto;
+    padding: 0;
+    max-width: 340px;
+    list-style: none;
+    font-size: 18px;
+  }
+  .board li {
+    display: flex;
+    gap: 10px;
+    padding: 5px 10px;
+    border-radius: 8px;
+  }
+  .board li:nth-child(odd) { background: rgba(255, 255, 255, 0.06); }
+  .board li.me { background: rgba(255, 217, 59, 0.25); font-weight: 700; }
+  .board .rank { width: 2em; }
+  .board .name { flex: 1; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="hud hidden" id="hud">
+  <span>מיניונים: <span id="score">0</span></span>
+  <span>זמן: <span id="time">30.0</span></span>
+</div>
+
+<!-- התוכן של הפאנל (הרשמה / פתיחה / סיום) נבנה ב-JS -->
+<div class="panel" id="panel"></div>
+
+<script>
+const GAME_SECONDS = 30;
+const HOLD_SECONDS = 1.5;      // כמה זמן צריך להחזיק את האור על המיניון
+const DECOYS = 12;             // בננות שמסתתרות בחושך ומבלבלות
+const TOUCH_OFFSET = 70;       // במגע האור מעל האצבע, כדי שהאצבע לא תסתיר אותו
+const PRIZE_LIFETIME = 7;      // שניות עד שפרס שלא נתפס נעלם
+const PRIZE_DELAY = [4, 9];    // טווח השניות עד שמופיע הפרס הבא
+const BLINK_SECONDS = 2;       // הפרס מהבהב בשניות האחרונות שלו
+const PLAYER_KEY = "minion-hunt-player";
+const ONLINE_TIMEOUT = 10000;  // אחרי כמה מילישניות מוותרים על השרת
+const BOARD_SIZE = 10;         // כמה שחקנים מוצגים בטבלת השיאים
+
+const PRIZES = {
+  diamond: { points: 2, seconds: 0, pop: "+2", color: "#5ee7ff" },
+  clock: { points: 0, seconds: 10, pop: "+10", color: "#ff9f43" },
+};
+
+const COLORS = {
+  floor: "#d9cfa8",
+  plank: "#c7bb90",
+  yellow: "#ffd93b",
+  blue: "#2f6fb5",
+  black: "#222222",
+  goggle: "#9a9a9a",
+  iris: "#7a4a1e",
+  banana: "#ffe14d",
+  bananaEdge: "#8a6d1c",
+  progress: "#4cd964",
+};
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const scoreEl = document.getElementById("score");
+const timeEl = document.getElementById("time");
+const panel = document.getElementById("panel");
+
+// מיקומים נשמרים כיחס (0..1) מגודל המסך, כך ששינוי גודל החלון לא שובר את המשחק
+const game = {
+  state: "start",              // start / playing / over
+  score: 0,
+  player: loadPlayer(),        // {name, family} או null אם עוד לא נרשמו
+  endTime: 0,
+  minion: null,                // {x, y, eyes, hold}
+  prize: null,                 // {x, y, type, born, hold}
+  nextPrizeAt: 0,
+  bananas: [],
+  pops: [],                    // אנימציות "+1" / "+2" / "+10"
+  pointer: { x: 0.5, y: 0.5 },
+};
+
+let width = 0, height = 0, unit = 1;
+
+// השחקן נזכר בדפדפן, כדי שלא יצטרכו להירשם מחדש בכל פעם
+function loadPlayer() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PLAYER_KEY));
+    return p && p.name && p.family ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePlayer(p) {
+  try {
+    if (p) localStorage.setItem(PLAYER_KEY, JSON.stringify(p));
+    else localStorage.removeItem(PLAYER_KEY);
+  } catch { /* לא חובה */ }
+}
+
+function resize() {
+  const ratio = window.devicePixelRatio || 1;
+  width = window.innerWidth;
+  height = window.innerHeight;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  unit = Math.min(width, height) / 700;   // קנה מידה לדמויות ולאור
+}
+
+function lightRadius() {
+  return Math.max(70, Math.min(120, 90 * unit));
+}
+
+function toPx(p) {
+  return { x: p.x * width, y: p.y * height };
+}
+
+// ---------- אירועי עכבר ומגע ----------
+
+function onPointer(event) {
+  const offset = event.pointerType === "touch" ? TOUCH_OFFSET : 0;
+  game.pointer = {
+    x: event.clientX / width,
+    y: Math.max(0, event.clientY - offset) / height,
+  };
+}
+
+canvas.addEventListener("pointermove", onPointer);
+canvas.addEventListener("pointerdown", onPointer);
+window.addEventListener("resize", resize);
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;   // בטופס ההרשמה Enter שולח את הטופס
+  if ((e.key === "Enter" || e.key === " ") && game.state !== "playing" && game.player) {
+    e.preventDefault();
+    startGame();
+  }
+});
+
+// ---------- הרשמה וטבלת שיאים ----------
+
+// window.leaderboard מוגדר בסקריפט ה-Firebase שבסוף הקובץ, שנטען אחרי הסקריפט הזה
+const leaderboardReady = new Promise((resolve) => {
+  if (window.leaderboard) resolve(window.leaderboard);
+  else window.addEventListener("leaderboard-ready", () => resolve(window.leaderboard), { once: true });
+});
+
+// מריץ פעולה מול השרת, ומוותר אם אין תשובה תוך ONLINE_TIMEOUT
+function online(action) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject({ code: "timeout" }), ONLINE_TIMEOUT));
+  return Promise.race([leaderboardReady.then(action), timeout]);
+}
+
+function errorMessage(err) {
+  console.error(err);
+  const code = (err && err.code) || "";
+  if (code.includes("permission-denied")) return "קוד המשפחה לא נכון.";
+  if (code.includes("operation-not-allowed") || code.includes("admin-restricted")) {
+    return "הכניסה האנונימית לא מופעלת ב-Firebase.";
+  }
+  return "אין חיבור לשרת. נסו שוב בעוד רגע.";
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function playerKey(name) {
+  return name.trim().toLowerCase();
+}
+
+function showPanel(html) {
+  panel.innerHTML = html;
+  panel.classList.remove("hidden");
+}
+
+function switchPlayer() {
+  game.player = null;
+  savePlayer(null);
+  renderRegister();
+}
+
+function renderRegister(error = "") {
+  showPanel(`
+    <h1>ציד מיניונים</h1>
+    <p>לפני שמתחילים, איך קוראים לכם?</p>
+    <form class="form" id="register">
+      <label>כינוי
+        <input id="name" maxlength="16" autocomplete="nickname" required>
+      </label>
+      <label>קוד משפחה
+        <input id="family" maxlength="20" autocomplete="off" dir="ltr" required>
+      </label>
+      <p class="error" id="error">${escapeHtml(error)}</p>
+      <button type="submit" id="join">בואו נשחק</button>
+    </form>`);
+
+  const form = document.getElementById("register");
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = document.getElementById("name").value.trim();
+    const family = document.getElementById("family").value.trim().toUpperCase();
+    const errorEl = document.getElementById("error");
+    if (!name || name.includes("/")) {
+      errorEl.textContent = "הכינוי לא יכול להכיל את התו /";
+      return;
+    }
+    const join = document.getElementById("join");
+    join.disabled = true;
+    join.textContent = "בודק...";
+    // קריאת טבלת השיאים בודקת גם שקוד המשפחה נכון: חוקי האבטחה חוסמים קוד אחר
+    online((lb) => lb.top(family, BOARD_SIZE))
+      .then((rows) => {
+        game.player = { name, family };
+        savePlayer(game.player);
+        renderStart(rows);
+      })
+      .catch((err) => {
+        errorEl.textContent = errorMessage(err);
+        join.disabled = false;
+        join.textContent = "בואו נשחק";
+      });
+  });
+  document.getElementById("name").focus();
+}
+
+function renderStart(rows) {
+  if (!game.player) {
+    renderRegister();
+    return;
+  }
+  showPanel(`
+    <h1>ציד מיניונים</h1>
+    <p>שלום, <b>${escapeHtml(game.player.name)}</b>!
+      <button class="link" id="switch">לא אתם?</button></p>
+    <p>הכול חשוך, ורק סביב העכבר יש עיגול אור.</p>
+    <p>מצאו את המיניון והחזיקו עליו את האור שנייה וחצי כדי לתפוס אותו.</p>
+    <p>כמה מיניונים תתפסו ב-${GAME_SECONDS} שניות?</p>
+    <p>לפעמים מתחבא בחושך גם פרס, לזמן קצר:<br>
+      💎 יהלום - 2 נקודות &nbsp;|&nbsp; ⏰ שעון - 10 שניות נוספות</p>
+    <button id="start">התחל</button>
+    <div class="board" id="board"><p class="muted">טוען את טבלת השיאים...</p></div>`);
+  document.getElementById("start").addEventListener("click", startGame);
+  document.getElementById("switch").addEventListener("click", switchPlayer);
+  if (rows) renderBoard(rows);
+  else loadBoard();
+}
+
+function loadBoard() {
+  online((lb) => lb.top(game.player.family, BOARD_SIZE))
+    .then(renderBoard)
+    .catch((err) => {
+      const board = document.getElementById("board");
+      if (board) board.innerHTML = `<p class="muted">${errorMessage(err)}</p>`;
+    });
+}
+
+function renderBoard(rows) {
+  const board = document.getElementById("board");
+  if (!board) return;
+  if (!rows.length) {
+    board.innerHTML = `<h2>טבלת השיאים</h2><p class="muted">עוד אין שיאים. היו הראשונים!</p>`;
+    return;
+  }
+  const medals = ["🥇", "🥈", "🥉"];
+  const me = game.player ? playerKey(game.player.name) : "";
+  const items = rows.map((row, i) => `
+    <li class="${playerKey(row.name) === me ? "me" : ""}">
+      <span class="rank">${medals[i] || `${i + 1}.`}</span>
+      <span class="name">${escapeHtml(row.name)}</span>
+      <span>${row.best}</span>
+    </li>`);
+  board.innerHTML = `<h2>טבלת השיאים</h2><ol>${items.join("")}</ol>`;
+}
+
+// ---------- לוגיקת המשחק ----------
+
+function startGame() {
+  if (!game.player) return;
+  game.state = "playing";
+  const now = performance.now();
+  game.score = 0;
+  game.pops = [];
+  game.prize = null;
+  game.endTime = now + GAME_SECONDS * 1000;
+  scheduleNextPrize(now);
+  game.bananas = Array.from({ length: DECOYS }, () => ({
+    x: 0.05 + Math.random() * 0.9,
+    y: 0.12 + Math.random() * 0.83,
+    angle: Math.random() * Math.PI * 2,
+  }));
+  spawnMinion();
+  panel.classList.add("hidden");
+  hud.classList.remove("hidden");
+  scoreEl.textContent = "0";
+}
+
+function randomSpot(avoid) {
+  // מקום חדש רחוק מהאור ומהדמויות שכבר על הלוח, כדי שיהיה צריך לחפש
+  const minDistance = Math.min(width, height) * 0.35;
+  const others = avoid.filter(Boolean).map(toPx);
+  let x, y;
+  for (let tries = 0; tries < 50; tries++) {
+    x = 0.08 + Math.random() * 0.84;
+    y = 0.2 + Math.random() * 0.68;
+    if (others.every((o) => Math.hypot(x * width - o.x, y * height - o.y) > minDistance)) break;
+  }
+  return { x, y };
+}
+
+function spawnMinion() {
+  const spot = randomSpot([game.pointer, game.prize]);
+  game.minion = { ...spot, eyes: Math.random() < 0.5 ? 1 : 2, hold: 0 };
+}
+
+function spawnPrize(now) {
+  const spot = randomSpot([game.pointer, game.minion]);
+  const type = Math.random() < 0.5 ? "diamond" : "clock";
+  game.prize = { ...spot, type, born: now, hold: 0 };
+}
+
+function scheduleNextPrize(now) {
+  const [min, max] = PRIZE_DELAY;
+  game.nextPrizeAt = now + (min + Math.random() * (max - min)) * 1000;
+}
+
+function flash(el) {
+  el.classList.add("bonus");
+  setTimeout(() => el.classList.remove("bonus"), 700);
+}
+
+// מעדכן את זמן ההחזקה של האור על דמות, ומחזיר true כשהיא נתפסה
+function holdLight(target, dt) {
+  const p = toPx(target);
+  const pointer = toPx(game.pointer);
+  if (Math.hypot(p.x - pointer.x, p.y - pointer.y) < lightRadius() * 0.85) {
+    target.hold += dt;
+    return target.hold >= HOLD_SECONDS;
+  }
+  target.hold = 0;
+  return false;
+}
+
+function endGame() {
+  game.state = "over";
+  const { name, family } = game.player;
+  const score = game.score;
+  const caught = score === 1 ? "מיניון אחד" : `${score} מיניונים`;
+  showPanel(`
+    <h1>נגמר הזמן!</h1>
+    <p class="score">תפסתם ${caught}</p>
+    <p id="saved" class="muted">שומר את הניקוד...</p>
+    <button id="again">שחק שוב</button>
+    <button class="link" id="switch">החלפת שחקן</button>
+    <div class="board" id="board"></div>`);
+  document.getElementById("again").addEventListener("click", startGame);
+  document.getElementById("switch").addEventListener("click", switchPlayer);
+
+  online((lb) => lb.save(family, name, score))
+    .then(({ best, isNewBest }) => {
+      const saved = document.getElementById("saved");
+      if (saved) {
+        saved.className = isNewBest ? "score" : "muted";
+        saved.textContent = isNewBest ? "🎉 שיא אישי חדש!" : `השיא שלכם: ${best}`;
+      }
+      loadBoard();
+    })
+    .catch((err) => {
+      const saved = document.getElementById("saved");
+      if (saved) saved.textContent = `לא הצלחנו לשמור את הניקוד. ${errorMessage(err)}`;
+    });
+}
+
+function update(dt, now) {
+  game.pops = game.pops.filter((p) => now - p.born < 700);
+  if (game.state !== "playing") return;
+
+  const left = Math.max(0, (game.endTime - now) / 1000);
+  timeEl.textContent = left.toFixed(1);
+  timeEl.classList.toggle("low", left <= 5);
+  if (left <= 0) {
+    endGame();
+    return;
+  }
+
+  if (holdLight(game.minion, dt)) {
+    game.score += 1;
+    scoreEl.textContent = String(game.score);
+    game.pops.push({ x: game.minion.x, y: game.minion.y, born: now, text: "+1", color: COLORS.progress });
+    spawnMinion();
+  }
+
+  const prize = game.prize;
+  if (!prize) {
+    if (now >= game.nextPrizeAt) spawnPrize(now);
+  } else if (holdLight(prize, dt)) {
+    const info = PRIZES[prize.type];
+    game.score += info.points;
+    game.endTime += info.seconds * 1000;
+    scoreEl.textContent = String(game.score);
+    flash(info.points ? scoreEl : timeEl);
+    game.pops.push({ x: prize.x, y: prize.y, born: now, text: info.pop, color: info.color });
+    game.prize = null;
+    scheduleNextPrize(now);
+  } else if (now - prize.born > PRIZE_LIFETIME * 1000) {
+    game.prize = null;
+    scheduleNextPrize(now);
+  }
+}
+
+// ---------- ציור ----------
+
+function drawFloor() {
+  ctx.fillStyle = COLORS.floor;
+  ctx.fillRect(0, 0, width, height);
+  // קרשי רצפה
+  const plank = 60 * unit;
+  ctx.strokeStyle = COLORS.plank;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let row = 0, y = 0; y < height; row++, y += plank) {
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    for (let x = (row % 2) * plank * 2; x < width; x += plank * 4) {
+      ctx.moveTo(x, y);
+      ctx.lineTo(x, y + plank);
+    }
+  }
+  ctx.stroke();
+}
+
+function drawBanana(b) {
+  const p = toPx(b);
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(b.angle);
+  ctx.scale(unit, unit);
+  const deg = Math.PI / 180;
+  ctx.beginPath();
+  ctx.arc(0, 0, 22, 20 * deg, 160 * deg);
+  ctx.arc(0, -8, 18, 160 * deg, 20 * deg, true);
+  ctx.closePath();
+  ctx.fillStyle = COLORS.banana;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = COLORS.bananaEdge;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function circle(x, y, r, fill) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+function line(x1, y1, x2, y2, color, w) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = w;
+  ctx.lineCap = "round";
+  ctx.stroke();
+}
+
+function drawMinion(m) {
+  const p = toPx(m);
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.scale(unit * 1.1, unit * 1.1);
+
+  // ידיים ורגליים
+  line(-25, 5, -40, 25, COLORS.yellow, 6);
+  line(25, 5, 40, 25, COLORS.yellow, 6);
+  ctx.fillStyle = COLORS.black;
+  ctx.fillRect(-15, 50, 10, 15);
+  ctx.fillRect(5, 50, 10, 15);
+
+  // גוף בצורת קפסולה
+  const body = new Path2D();
+  body.arc(0, -25, 25, Math.PI, 0);
+  body.arc(0, 30, 25, 0, Math.PI);
+  body.closePath();
+  ctx.fillStyle = COLORS.yellow;
+  ctx.fill(body);
+
+  // סרבל ורצועת משקפיים, חתוכים לצורת הגוף
+  ctx.save();
+  ctx.clip(body);
+  ctx.fillStyle = COLORS.blue;
+  ctx.fillRect(-30, 15, 60, 50);
+  ctx.fillStyle = COLORS.black;
+  ctx.fillRect(-30, -24, 60, 9);
+  ctx.restore();
+  line(-25, 0, -12, 15, COLORS.blue, 4);
+  line(25, 0, 12, 15, COLORS.blue, 4);
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = COLORS.black;
+  ctx.stroke(body);
+
+  // שיער
+  for (const dx of [-8, 0, 8]) line(dx, -49, dx * 1.5, -60, COLORS.black, 2);
+
+  // עיניים
+  const eyes = m.eyes === 1 ? [[0, 15]] : [[-11, 11], [11, 11]];
+  for (const [ex, r] of eyes) {
+    circle(ex, -20, r, COLORS.goggle);
+    circle(ex, -20, r - 3, "#ffffff");
+    circle(ex, -20, r * 0.4, COLORS.iris);
+    circle(ex, -20, r * 0.18, COLORS.black);
+  }
+
+  // חיוך
+  ctx.beginPath();
+  ctx.arc(0, -2, 10, Math.PI / 6, (5 * Math.PI) / 6);
+  ctx.strokeStyle = COLORS.black;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawDiamond() {
+  ctx.beginPath();
+  ctx.moveTo(-22, -8);
+  ctx.lineTo(-12, -20);
+  ctx.lineTo(12, -20);
+  ctx.lineTo(22, -8);
+  ctx.lineTo(0, 22);
+  ctx.closePath();
+  ctx.fillStyle = "#5ee7ff";
+  ctx.fill();
+  ctx.strokeStyle = "#1b7fa3";
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  // פאות
+  ctx.beginPath();
+  ctx.moveTo(-22, -8);
+  ctx.lineTo(22, -8);
+  ctx.moveTo(-12, -20);
+  ctx.lineTo(-6, -8);
+  ctx.lineTo(0, 22);
+  ctx.lineTo(6, -8);
+  ctx.lineTo(12, -20);
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-10, -17);
+  ctx.lineTo(-4, -17);
+  ctx.lineTo(-8, -11);
+  ctx.closePath();
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+}
+
+function drawClock() {
+  // פעמונים ורגליים של שעון מעורר
+  circle(-16, -20, 9, "#c93a3a");
+  circle(16, -20, 9, "#c93a3a");
+  line(-13, 17, -19, 27, COLORS.black, 3);
+  line(13, 17, 19, 27, COLORS.black, 3);
+  circle(0, 0, 22, "#e04848");
+  circle(0, 0, 17, "#ffffff");
+  for (let i = 0; i < 12; i += 3) {
+    const a = (i / 12) * Math.PI * 2;
+    line(Math.cos(a) * 13, Math.sin(a) * 13, Math.cos(a) * 15.5, Math.sin(a) * 15.5, COLORS.black, 2);
+  }
+  line(0, 0, 0, -11, COLORS.black, 2.5);
+  line(0, 0, 8, 3, COLORS.black, 2.5);
+  circle(0, 0, 2.5, COLORS.black);
+}
+
+function drawPrize(prize, now) {
+  const p = toPx(prize);
+  const left = PRIZE_LIFETIME - (now - prize.born) / 1000;
+  ctx.save();
+  if (left < BLINK_SECONDS) ctx.globalAlpha = 0.35 + 0.65 * Math.abs(Math.cos(now / 120));
+  ctx.translate(p.x, p.y);
+  ctx.scale(unit * 1.1, unit * 1.1);
+  if (prize.type === "diamond") drawDiamond();
+  else drawClock();
+  ctx.restore();
+}
+
+function drawProgress(target, radius) {
+  const p = toPx(target);
+  const portion = Math.min(target.hold / HOLD_SECONDS, 1);
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, radius * unit, -Math.PI / 2, -Math.PI / 2 + portion * Math.PI * 2);
+  ctx.strokeStyle = COLORS.progress;
+  ctx.lineWidth = 7;
+  ctx.lineCap = "round";
+  ctx.stroke();
+}
+
+function drawPops(now) {
+  for (const pop of game.pops) {
+    const age = (now - pop.born) / 700;
+    const p = toPx(pop);
+    ctx.globalAlpha = 1 - age;
+    ctx.fillStyle = pop.color;
+    ctx.font = `bold ${Math.round(40 * unit)}px "Segoe UI", Arial, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.direction = "ltr";   // הדף מימין לשמאל, ובלי זה ה-canvas מצייר "1+"
+    ctx.fillText(pop.text, p.x, p.y - 70 * unit - age * 60 * unit);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawDarkness() {
+  // שיפוע רדיאלי: שקוף במרכז ושחור בקצה. מחוץ לרדיוס נשאר הצבע האחרון - שחור מלא
+  const p = toPx(game.pointer);
+  const r = lightRadius();
+  const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+  glow.addColorStop(0, "rgba(0, 0, 0, 0)");
+  glow.addColorStop(0.65, "rgba(0, 0, 0, 0.05)");
+  glow.addColorStop(1, "rgba(0, 0, 0, 1)");
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function draw(now) {
+  drawFloor();
+  if (game.state !== "start") {
+    game.bananas.forEach(drawBanana);
+    drawMinion(game.minion);
+    if (game.prize) drawPrize(game.prize, now);
+  }
+  // בסוף המשחק האורות נדלקים - רואים איפה המיניון התחבא
+  if (game.state !== "over") drawDarkness();
+  if (game.state === "playing") {
+    if (game.minion.hold > 0) drawProgress(game.minion, 78);
+    if (game.prize && game.prize.hold > 0) drawProgress(game.prize, 40);
+  }
+  drawPops(now);
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  update(dt, now);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+
+resize();
+renderStart();
+requestAnimationFrame(frame);
+</script>
+
+<!-- שמירת ניקוד בענן עם Firebase: כניסה אנונימית + מסד הנתונים Firestore.
+     ההגדרות האלה אינן סוד - ההגנה על הנתונים היא בחוקי האבטחה (firestore.rules). -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDocs, query, orderBy, limit, runTransaction, serverTimestamp,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB2txVMB6bVKoJg77w2W9EajDeTJK8zhQQ",
+  authDomain: "minion-hunt.firebaseapp.com",
+  projectId: "minion-hunt",
+  storageBucket: "minion-hunt.firebasestorage.app",
+  messagingSenderId: "292686756043",
+  appId: "1:292686756043:web:2fd68622bd3239099f834e",
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const signedIn = signInAnonymously(getAuth(app));
+
+// מבנה הנתונים: families/{קוד משפחה}/players/{כינוי באותיות קטנות}
+function players(family) {
+  return collection(db, "families", family, "players");
+}
+
+window.leaderboard = {
+  async top(family, count) {
+    await signedIn;
+    const snap = await getDocs(query(players(family), orderBy("best", "desc"), limit(count)));
+    return snap.docs.map((d) => d.data());
+  },
+
+  // שומר משחק שהסתיים ומעדכן את השיא של השחקן אם צריך
+  async save(family, name, score) {
+    await signedIn;
+    const ref = doc(players(family), name.trim().toLowerCase());
+    return runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const old = snap.exists() ? snap.data() : null;
+      const best = Math.max(score, old ? old.best : 0);
+      tx.set(ref, {
+        name: name.trim(),
+        best,
+        games: (old ? old.games : 0) + 1,
+        lastScore: score,
+        updatedAt: serverTimestamp(),
+      });
+      return { best, isNewBest: !old || score > old.best };
+    });
+  },
+};
+
+window.dispatchEvent(new Event("leaderboard-ready"));
+</script>
+</body>
+</html>
