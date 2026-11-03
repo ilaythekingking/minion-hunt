@@ -104,6 +104,16 @@
     border: none;
     border-radius: 10px;
   }
+  .tabs { display: flex; gap: 8px; justify-content: center; margin-bottom: 4px; }
+  .panel .tabs button {
+    margin-top: 0;
+    padding: 8px 18px;
+    font-size: 18px;
+    color: var(--hud);
+    background: transparent;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+  }
+  .panel .tabs button.active { color: #222; background: var(--accent); border-color: var(--accent); }
   .board ol {
     margin: 0 auto;
     padding: 0;
@@ -175,7 +185,7 @@ const panel = document.getElementById("panel");
 const game = {
   state: "start",              // start / playing / over
   score: 0,
-  player: loadPlayer(),        // {name, family} או null אם עוד לא נרשמו
+  player: loadPlayer(),        // {name, group, groupName} או null אם לא מחוברים
   endTime: 0,
   minion: null,                // {x, y, eyes, hold}
   prize: null,                 // {x, y, type, born, hold}
@@ -191,7 +201,7 @@ let width = 0, height = 0, unit = 1;
 function loadPlayer() {
   try {
     const p = JSON.parse(localStorage.getItem(PLAYER_KEY));
-    return p && p.name && p.family ? p : null;
+    return p && p.name && p.group ? p : null;
   } catch {
     return null;
   }
@@ -258,20 +268,32 @@ function online(action) {
   return Promise.race([leaderboardReady.then(action), timeout]);
 }
 
+const WRONG_LOGIN = "כינוי או סיסמה לא נכונים.";
+const NAME_TAKEN = "הכינוי כבר תפוס בקבוצה הזו. אם זה אתם, בחרו \"כניסה\".";
+const ERRORS = {
+  "bad-group": "קוד הקבוצה לא נכון.",
+  "group-closed": "ההרשמה לקבוצה הזו סגורה. בקשו מהמנהל לפתוח אותה.",
+  "name-taken": NAME_TAKEN,
+  "auth/email-already-in-use": NAME_TAKEN,
+  "auth/invalid-credential": WRONG_LOGIN,
+  "auth/invalid-login-credentials": WRONG_LOGIN,
+  "auth/wrong-password": WRONG_LOGIN,
+  "auth/user-not-found": WRONG_LOGIN,
+  "auth/weak-password": "הסיסמה חייבת להכיל לפחות 6 תווים.",
+  "auth/too-many-requests": "יותר מדי ניסיונות. נסו שוב בעוד כמה דקות.",
+  "auth/operation-not-allowed": "הכניסה עם סיסמה לא מופעלת ב-Firebase.",
+  "permission-denied": "אין הרשאה. נסו להתנתק ולהיכנס שוב.",
+};
+
 function errorMessage(err) {
   console.error(err);
-  const code = (err && err.code) || "";
-  if (code.includes("permission-denied")) return "קוד המשפחה לא נכון.";
-  if (code.includes("operation-not-allowed") || code.includes("admin-restricted")) {
-    return "הכניסה האנונימית לא מופעלת ב-Firebase.";
-  }
-  return "אין חיבור לשרת. נסו שוב בעוד רגע.";
+  return ERRORS[(err && err.code) || ""] || "אין חיבור לשרת. נסו שוב בעוד רגע.";
 }
 
 function escapeHtml(text) {
   const div = document.createElement("div");
   div.textContent = text;
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, "&quot;");
 }
 
 function playerKey(name) {
@@ -284,63 +306,91 @@ function showPanel(html) {
 }
 
 function switchPlayer() {
+  const prefill = { group: game.player ? game.player.group : "" };
   game.player = null;
   savePlayer(null);
-  renderRegister();
+  online((lb) => lb.logout()).catch(() => { /* מתנתקים מקומית בכל מקרה */ });
+  renderLogin("login", "", prefill);
 }
 
-function renderRegister(error = "") {
+// mode: "login" לשחקן קיים, "register" לשחקן חדש
+function renderLogin(mode = "login", error = "", prefill = {}) {
+  const isNew = mode === "register";
+  game.state = "start";        // חוזרים לחושך של מסך הפתיחה
+  hud.classList.add("hidden");
   showPanel(`
     <h1>ציד מיניונים</h1>
-    <p>לפני שמתחילים, איך קוראים לכם?</p>
-    <form class="form" id="register">
+    <div class="tabs">
+      <button type="button" id="tab-login" class="${isNew ? "" : "active"}">כניסה</button>
+      <button type="button" id="tab-register" class="${isNew ? "active" : ""}">שחקן חדש</button>
+    </div>
+    <form class="form" id="login">
+      <label>קוד קבוצה
+        <input id="group" maxlength="30" autocomplete="off" dir="ltr" required
+               value="${escapeHtml(prefill.group || "")}">
+      </label>
       <label>כינוי
-        <input id="name" maxlength="16" autocomplete="nickname" required>
+        <input id="name" maxlength="16" autocomplete="username" required
+               value="${escapeHtml(prefill.name || "")}">
       </label>
-      <label>קוד משפחה
-        <input id="family" maxlength="20" autocomplete="off" dir="ltr" required>
+      <label>סיסמה
+        <input id="password" type="password" minlength="6" required
+               autocomplete="${isNew ? "new-password" : "current-password"}">
       </label>
+      ${isNew ? `<label>שוב את הסיסמה
+        <input id="password2" type="password" minlength="6" autocomplete="new-password" required>
+      </label>` : ""}
       <p class="error" id="error">${escapeHtml(error)}</p>
-      <button type="submit" id="join">בואו נשחק</button>
+      <button type="submit" id="submit">${isNew ? "הרשמה" : "כניסה"}</button>
     </form>`);
 
-  const form = document.getElementById("register");
-  form.addEventListener("submit", (e) => {
+  const value = (id) => document.getElementById(id).value;
+  const typed = () => ({ group: value("group").trim().toUpperCase(), name: value("name").trim() });
+  document.getElementById("tab-login").addEventListener("click", () => renderLogin("login", "", typed()));
+  document.getElementById("tab-register").addEventListener("click", () => renderLogin("register", "", typed()));
+
+  document.getElementById("login").addEventListener("submit", (e) => {
     e.preventDefault();
-    const name = document.getElementById("name").value.trim();
-    const family = document.getElementById("family").value.trim().toUpperCase();
+    const { group, name } = typed();
+    const password = value("password");
     const errorEl = document.getElementById("error");
-    if (!name || name.includes("/")) {
+    if (name.includes("/")) {
       errorEl.textContent = "הכינוי לא יכול להכיל את התו /";
       return;
     }
-    const join = document.getElementById("join");
-    join.disabled = true;
-    join.textContent = "בודק...";
-    // קריאת טבלת השיאים בודקת גם שקוד המשפחה נכון: חוקי האבטחה חוסמים קוד אחר
-    online((lb) => lb.top(family, BOARD_SIZE))
-      .then((rows) => {
-        game.player = { name, family };
+    if (isNew && password !== value("password2")) {
+      errorEl.textContent = "הסיסמאות לא זהות.";
+      return;
+    }
+    const submit = document.getElementById("submit");
+    submit.disabled = true;
+    submit.textContent = "רגע...";
+    online((lb) => (isNew ? lb.register(group, name, password) : lb.login(group, name, password)))
+      .then(({ groupName }) => {
+        game.player = { name, group, groupName };
         savePlayer(game.player);
-        renderStart(rows);
+        renderStart();
       })
       .catch((err) => {
         errorEl.textContent = errorMessage(err);
-        join.disabled = false;
-        join.textContent = "בואו נשחק";
+        submit.disabled = false;
+        submit.textContent = isNew ? "הרשמה" : "כניסה";
       });
   });
-  document.getElementById("name").focus();
+
+  const empty = ["group", "name", "password"].find((id) => !value(id));
+  document.getElementById(empty || "password").focus();
 }
 
-function renderStart(rows) {
+function renderStart() {
   if (!game.player) {
-    renderRegister();
+    renderLogin();
     return;
   }
+  const groupName = game.player.groupName ? ` (${escapeHtml(game.player.groupName)})` : "";
   showPanel(`
     <h1>ציד מיניונים</h1>
-    <p>שלום, <b>${escapeHtml(game.player.name)}</b>!
+    <p>שלום, <b>${escapeHtml(game.player.name)}</b>!${groupName}
       <button class="link" id="switch">לא אתם?</button></p>
     <p>הכול חשוך, ורק סביב העכבר יש עיגול אור.</p>
     <p>מצאו את המיניון והחזיקו עליו את האור שנייה וחצי כדי לתפוס אותו.</p>
@@ -351,12 +401,26 @@ function renderStart(rows) {
     <div class="board" id="board"><p class="muted">טוען את טבלת השיאים...</p></div>`);
   document.getElementById("start").addEventListener("click", startGame);
   document.getElementById("switch").addEventListener("click", switchPlayer);
-  if (rows) renderBoard(rows);
-  else loadBoard();
+
+  // החיבור ל-Firebase נשמר בדפדפן. אם הוא פג, מבקשים את הסיסמה שוב
+  online((lb) => lb.currentUser())
+    .then((user) => {
+      if (user) {
+        loadBoard();
+      } else {
+        const prefill = { ...game.player };
+        game.player = null;
+        renderLogin("login", "צריך להיכנס שוב עם הסיסמה.", prefill);
+      }
+    })
+    .catch((err) => {
+      const board = document.getElementById("board");
+      if (board) board.innerHTML = `<p class="muted">${errorMessage(err)}</p>`;
+    });
 }
 
 function loadBoard() {
-  online((lb) => lb.top(game.player.family, BOARD_SIZE))
+  online((lb) => lb.top(game.player.group, BOARD_SIZE))
     .then(renderBoard)
     .catch((err) => {
       const board = document.getElementById("board");
@@ -452,7 +516,7 @@ function holdLight(target, dt) {
 
 function endGame() {
   game.state = "over";
-  const { name, family } = game.player;
+  const { name, group } = game.player;
   const score = game.score;
   const caught = score === 1 ? "מיניון אחד" : `${score} מיניונים`;
   showPanel(`
@@ -465,7 +529,7 @@ function endGame() {
   document.getElementById("again").addEventListener("click", startGame);
   document.getElementById("switch").addEventListener("click", switchPlayer);
 
-  online((lb) => lb.save(family, name, score))
+  online((lb) => lb.save(group, name, score))
     .then(({ best, isNewBest }) => {
       const saved = document.getElementById("saved");
       if (saved) {
@@ -762,13 +826,17 @@ renderStart();
 requestAnimationFrame(frame);
 </script>
 
-<!-- שמירת ניקוד בענן עם Firebase: כניסה אנונימית + מסד הנתונים Firestore.
+<!-- שמירת ניקוד בענן עם Firebase: כניסה עם כינוי וסיסמה + מסד הנתונים Firestore.
      ההגדרות האלה אינן סוד - ההגנה על הנתונים היא בחוקי האבטחה (firestore.rules). -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getFirestore, collection, doc, getDocs, query, orderBy, limit, runTransaction, serverTimestamp,
+  getAuth, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  signOut, deleteUser,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, query, orderBy, limit, runTransaction,
+  serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -782,36 +850,117 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
-const signedIn = signInAnonymously(getAuth(app));
+const auth = getAuth(app);
 
-// מבנה הנתונים: families/{קוד משפחה}/players/{כינוי באותיות קטנות}
-function players(family) {
-  return collection(db, "families", family, "players");
+// Firebase זוכר את החיבור בדפדפן. מחכים לבדיקה הראשונה שלו לפני שמחליטים אם מחוברים
+const authReady = new Promise((resolve) => {
+  const stop = onAuthStateChanged(auth, () => {
+    stop();
+    resolve();
+  });
+});
+
+function fail(code) {
+  const err = new Error(code);
+  err.code = code;
+  return err;
+}
+
+function nameKey(name) {
+  return name.trim().toLowerCase();
+}
+
+// Firebase מזהה משתמשים לפי אימייל, ולכן לכל צירוף של קבוצה + כינוי נוצר "אימייל" פיקטיבי וקבוע
+// (גיבוב SHA-256). כך Firebase עצמו מבטיח שאין שני חשבונות עם אותו כינוי באותה קבוצה,
+// ושומר את הסיסמאות בצורה מאובטחת. לכתובות האלה אף פעם לא נשלח דואר.
+async function emailFor(group, name) {
+  const bytes = new TextEncoder().encode(`${group}/${nameKey(name)}`);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const hex = [...hash].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 40)}@minion-hunt.example.com`;
+}
+
+// מבנה הנתונים: groups/{קוד קבוצה}/players/{כינוי באותיות קטנות}
+function playerRef(group, name) {
+  return doc(db, "groups", group, "players", nameKey(name));
+}
+
+// קבוצות נוצרות רק על ידי המנהל במסוף Firebase
+async function groupInfo(group) {
+  const snap = await getDoc(doc(db, "groups", group));
+  if (!snap.exists()) throw fail("bad-group");
+  return snap.data();
 }
 
 window.leaderboard = {
-  async top(family, count) {
-    await signedIn;
-    const snap = await getDocs(query(players(family), orderBy("best", "desc"), limit(count)));
-    return snap.docs.map((d) => d.data());
+  // מחזיר את השחקן המחובר, או null. חיבור אנונימי מגרסה קודמת של המשחק לא נחשב
+  async currentUser() {
+    await authReady;
+    const user = auth.currentUser;
+    return user && !user.isAnonymous ? { uid: user.uid } : null;
+  },
+
+  async register(group, name, password) {
+    const info = await groupInfo(group);
+    if (!info.open) throw fail("group-closed");
+    const { user } = await createUserWithEmailAndPassword(auth, await emailFor(group, name), password);
+    try {
+      await runTransaction(db, async (tx) => {
+        const ref = playerRef(group, name);
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          tx.set(ref, {
+            name: name.trim(), uid: user.uid, best: 0, games: 0, lastScore: 0,
+            updatedAt: serverTimestamp(),
+          });
+        } else if (snap.data().uid === "") {
+          // המנהל שחרר את הכינוי (למשל אחרי סיסמה שנשכחה): לוקחים אותו עם הניקוד הקיים
+          tx.update(ref, { uid: user.uid, updatedAt: serverTimestamp() });
+        } else {
+          throw fail("name-taken");
+        }
+      });
+    } catch (err) {
+      await deleteUser(user).catch(() => {});   // לא משאירים חשבון בלי שחקן
+      throw err;
+    }
+    return { groupName: info.name };
+  },
+
+  async login(group, name, password) {
+    const info = await groupInfo(group);
+    await signInWithEmailAndPassword(auth, await emailFor(group, name), password);
+    return { groupName: info.name };
+  },
+
+  logout() {
+    return signOut(auth);
+  },
+
+  async top(group, count) {
+    await authReady;
+    const players = collection(db, "groups", group, "players");
+    const snap = await getDocs(query(players, orderBy("best", "desc"), limit(count)));
+    return snap.docs.map((d) => d.data()).filter((p) => p.games > 0);
   },
 
   // שומר משחק שהסתיים ומעדכן את השיא של השחקן אם צריך
-  async save(family, name, score) {
-    await signedIn;
-    const ref = doc(players(family), name.trim().toLowerCase());
+  async save(group, name, score) {
+    if (!(await this.currentUser())) throw fail("permission-denied");
+    const ref = playerRef(group, name);
     return runTransaction(db, async (tx) => {
       const snap = await tx.get(ref);
-      const old = snap.exists() ? snap.data() : null;
-      const best = Math.max(score, old ? old.best : 0);
+      const old = snap.exists() ? snap.data() : { name: name.trim(), best: 0, games: 0 };
+      const best = Math.max(score, old.best);
       tx.set(ref, {
-        name: name.trim(),
+        name: old.name,
+        uid: auth.currentUser.uid,
         best,
-        games: (old ? old.games : 0) + 1,
+        games: old.games + 1,
         lastScore: score,
         updatedAt: serverTimestamp(),
       });
-      return { best, isNewBest: !old || score > old.best };
+      return { best, isNewBest: score > old.best };
     });
   },
 };
